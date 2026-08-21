@@ -27,7 +27,7 @@ COPY --from=frontend-build /build/frontend/dist ./frontend/dist
 
 RUN mkdir -p /data
 VOLUME ["/data"]
-EXPOSE 8000
+EXPOSE 6000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:6000/api/health', timeout=3)"
 CMD ["python", "server.py"]
