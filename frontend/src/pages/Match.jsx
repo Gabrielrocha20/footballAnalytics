@@ -4,9 +4,9 @@ import { ChevronLeft } from 'lucide-react'
 import { api } from '../lib/api.js'
 import { formatDate } from '../lib/format.js'
 import { Loading, ErrorCard } from '../components/Ui.jsx'
-import { JobStatus } from '../components/SyncPanel.jsx'
 import {
   ProbabilityBar,
+  InsightsPanel,
   LayCard,
   HistoryTable,
   TeamSummary,
@@ -19,7 +19,6 @@ export function MatchPage() {
   const [data, setData] = useState(null)
   const [neural, setNeural] = useState(null)
   const [error, setError] = useState(null)
-  const [job, setJob] = useState(null)
 
   function load() {
     setError(null)
@@ -28,21 +27,6 @@ export function MatchPage() {
   }
 
   useEffect(load, [routeSource, matchId])
-
-  useEffect(() => {
-    if (!job || ['completed', 'failed'].includes(job.status)) return
-    const timer = setInterval(async () => {
-      const next = await api.job(job.id)
-      setJob(next)
-      if (next.status === 'completed') load()
-    }, 1300)
-    return () => clearInterval(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job])
-
-  async function collectMinutes() {
-    setJob(await api.minutes(routeSource, data.lay_01.missing_match_ids))
-  }
 
   if (error)
     return (
@@ -57,7 +41,8 @@ export function MatchPage() {
 
   const { match, prediction, lay_01: lay } = data
   const maxProbability = prediction ? Math.max(prediction.home, prediction.draw, prediction.away) : 0
-  const collecting = job && !['completed', 'failed'].includes(job.status)
+  const homePosition = data.insights?.standings?.home?.position
+  const awayPosition = data.insights?.standings?.away?.position
 
   return (
     <main>
@@ -72,12 +57,18 @@ export function MatchPage() {
           {match.rodada && <span>{match.rodada}</span>}
         </div>
         <div className="fixture">
-          <h1>{match.time_casa}</h1>
+          <h1>
+            {match.time_casa}
+            {homePosition && <small>{homePosition}º</small>}
+          </h1>
           <div>
             <span>PRÉ-JOGO</span>
             <strong>×</strong>
           </div>
-          <h1>{match.time_fora}</h1>
+          <h1>
+            {match.time_fora}
+            {awayPosition && <small>{awayPosition}º</small>}
+          </h1>
         </div>
       </section>
 
@@ -137,8 +128,9 @@ export function MatchPage() {
         </section>
       )}
 
-      <LayCard lay={lay} onCollect={collectMinutes} collecting={collecting} />
-      <JobStatus job={job} onClose={() => setJob(null)} />
+      <InsightsPanel insights={data.insights} />
+
+      <LayCard lay={lay} />
 
       <div className="summary-grid">
         <TeamSummary name={match.time_casa} data={data.home.summary} />

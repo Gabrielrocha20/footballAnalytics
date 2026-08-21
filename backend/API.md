@@ -451,6 +451,7 @@ A resposta contém:
 | `away` | Resumo e últimos 10 jogos do visitante |
 | `head_to_head` | Até 10 confrontos diretos anteriores |
 | `lay_01` | Avaliação do método Lay 0x1 |
+| `insights` | Sinais prontos de primeiro gol, reação, gol tardio, mando e classificação |
 | `advanced` | Distribuição temporal, primeiro gol, métricas de trading e xG |
 | `disclaimer` | Aviso sobre a natureza estatística da estimativa |
 
@@ -470,6 +471,25 @@ Exemplo de previsão:
 
 O favorito é o resultado com maior probabilidade individual. Isso é uma
 estimativa do modelo interno, não uma odd de mercado.
+
+### Análise inteligente
+
+`insights.items` transforma as métricas históricas em quatro leituras prontas
+para o frontend:
+
+- frequência com que o favorito do modelo abre o placar;
+- capacidade de empatar ou vencer depois de sofrer o primeiro gol;
+- frequência de gols do favorito após os 75 minutos;
+- aproveitamento recente do visitante fora de casa.
+
+Cada sinal informa `tone`, `title`, `detail`, `value`, `sample_size` e
+`available`. O bloco também retorna a posição dos dois times em `standings`,
+calculada somente com resultados anteriores ao início da partida e dentro da
+mesma temporada. Assim, uma análise histórica não recebe dados do futuro.
+
+Quando faltam eventos por minuto, `minute_coverage.missing_match_ids` lista as
+partidas que podem ser enviadas a `POST /api/minutes`. Fontes sem suporte a
+minutos retornam `minute_coverage.supported=false`.
 
 ### Poisson, placares exatos e odds justas
 

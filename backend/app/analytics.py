@@ -416,6 +416,222 @@ def _trading_metrics(history: list[dict], temporal: dict) -> dict:
     }
 
 
+def _standing_for(standings: list[dict], team_id: int) -> dict | None:
+    for row in standings:
+        value = row.get("time_id")
+        if value is not None and int(value) == team_id:
+            return {
+                "position": row.get("position"),
+                "played": row.get("played"),
+                "points": row.get("points"),
+                "goal_difference": row.get("goal_difference"),
+            }
+    return None
+
+
+def _intelligent_insights(
+    match: dict,
+    prediction: dict | None,
+    home_history: list[dict],
+    away_history: list[dict],
+    home_venue_history: list[dict],
+    away_venue_history: list[dict],
+    home_temporal: dict,
+    away_temporal: dict,
+    home_first_goal: dict,
+    away_first_goal: dict,
+    standings: list[dict],
+    covered_match_ids: list[int],
+    supports_minutes: bool,
+) -> dict:
+    home_id = int(match["time_casa_id"])
+    away_id = int(match["time_fora_id"])
+    home_standing = _standing_for(standings, home_id)
+    away_standing = _standing_for(standings, away_id)
+
+    favorite_side = None
+    if prediction:
+        favorite_side = "home" if prediction["home"] >= prediction["away"] else "away"
+    favorite_name = match[f"time_{'casa' if favorite_side == 'home' else 'fora'}"] if favorite_side else None
+    favorite_probability = prediction[favorite_side] if prediction and favorite_side else None
+    favorite_history = home_history if favorite_side == "home" else away_history
+    favorite_temporal = home_temporal if favorite_side == "home" else away_temporal
+    favorite_first_goal = home_first_goal if favorite_side == "home" else away_first_goal
+    covered_ids = set(covered_match_ids)
+    missing_match_ids = [
+        int(item["id_api"])
+        for item in favorite_history
+        if int(item["id_api"]) not in covered_ids
+    ] if favorite_side else []
+
+    items = []
+    first_goal_total = favorite_first_goal["matches_with_first_goal"] if favorite_side else 0
+    if first_goal_total:
+        first_goal_rate = round(favorite_first_goal["scored_first"] / first_goal_total * 100, 1)
+        if first_goal_rate >= 65:
+            tone, title = "positive", "Boa frequência de abrir o placar"
+        elif first_goal_rate >= 40:
+            tone, title = "warning", "Primeiro gol sem vantagem clara"
+        else:
+            tone, title = "negative", "Baixa frequência de abrir o placar"
+        items.append({
+            "id": "first_goal",
+            "tone": tone,
+            "title": title,
+            "detail": (
+                f"{favorite_name} marcou primeiro em {favorite_first_goal['scored_first']} "
+                f"de {first_goal_total} jogos com gol e eventos completos."
+            ),
+            "value": first_goal_rate,
+            "unit": "%",
+            "sample_size": first_goal_total,
+            "available": True,
+        })
+    else:
+        items.append({
+            "id": "first_goal",
+            "tone": "neutral",
+            "title": "Primeiro gol ainda sem cobertura" if supports_minutes else "Primeiro gol indisponível nesta fonte",
+            "detail": (
+                "Colete os minutos dos jogos anteriores para medir quem costuma abrir o placar."
+                if supports_minutes
+                else "A fonte selecionada não fornece eventos de gol por minuto."
+            ),
+            "value": None,
+            "unit": "%",
+            "sample_size": 0,
+            "available": False,
+        })
+
+    conceded_first = favorite_first_goal["conceded_first"] if favorite_side else 0
+    comeback_rate = favorite_first_goal.get("comeback_rate") if favorite_side else None
+    if conceded_first and comeback_rate is not None:
+        if comeback_rate >= 60:
+            tone, title = "positive", "Boa reação quando sai perdendo"
+        elif comeback_rate >= 35:
+            tone, title = "warning", "Reação moderada ao sofrer primeiro"
+        else:
+            tone, title = "negative", "Dificuldade para reagir ao primeiro gol"
+        recovered = favorite_first_goal["draws_or_wins_after_conceding_first"]
+        items.append({
+            "id": "comeback",
+            "tone": tone,
+            "title": title,
+            "detail": f"{favorite_name} evitou a derrota em {recovered} de {conceded_first} jogos após sofrer o primeiro gol.",
+            "value": comeback_rate,
+            "unit": "%",
+            "sample_size": conceded_first,
+            "available": True,
+        })
+    else:
+        items.append({
+            "id": "comeback",
+            "tone": "neutral",
+            "title": "Reação sem amostra suficiente",
+            "detail": "Não há jogos cobertos suficientes em que o favorito tenha sofrido o primeiro gol.",
+            "value": None,
+            "unit": "%",
+            "sample_size": conceded_first,
+            "available": False,
+        })
+
+    late = favorite_temporal.get("after_75", {}) if favorite_side else {}
+    late_rate = late.get("scored_match_rate")
+    covered_matches = favorite_temporal.get("covered_matches", 0) if favorite_side else 0
+    if covered_matches:
+        if late_rate >= 40:
+            tone, title = "positive", "Forte tendência de gol no fim"
+        elif late_rate >= 20:
+            tone, title = "warning", "Atenção aos gols depois dos 75 minutos"
+        else:
+            tone, title = "negative", "Poucos gols do favorito no fim"
+        items.append({
+            "id": "late_goal",
+            "tone": tone,
+            "title": title,
+            "detail": (
+                f"{favorite_name} marcou após os 75 minutos em {late.get('matches_scored', 0)} "
+                f"de {covered_matches} jogos com cobertura temporal."
+            ),
+            "value": late_rate,
+            "unit": "%",
+            "sample_size": covered_matches,
+            "available": True,
+        })
+    else:
+        items.append({
+            "id": "late_goal",
+            "tone": "neutral",
+            "title": "Gols no fim ainda sem cobertura",
+            "detail": "Os eventos por minuto dos jogos anteriores ainda não estão completos.",
+            "value": None,
+            "unit": "%",
+            "sample_size": 0,
+            "available": False,
+        })
+
+    away_venue = _summary(away_venue_history)
+    away_position = away_standing.get("position") if away_standing else None
+    position_text = f" é o {away_position}º colocado e" if away_position else ""
+    if away_venue["matches"] >= 3:
+        if away_venue["performance"] >= 60:
+            tone = "positive"
+        elif away_venue["performance"] >= 40:
+            tone = "warning"
+        else:
+            tone = "negative"
+        items.append({
+            "id": "away_form",
+            "tone": tone,
+            "title": f"Visitante{position_text} joga fora de casa" if away_position else "Desempenho recente do visitante fora",
+            "detail": (
+                f"{match['time_fora']} tem {away_venue['performance']}% de aproveitamento "
+                f"nos últimos {away_venue['matches']} jogos como visitante."
+            ),
+            "value": away_venue["performance"],
+            "unit": "%",
+            "sample_size": away_venue["matches"],
+            "available": True,
+        })
+    else:
+        items.append({
+            "id": "away_form",
+            "tone": "neutral",
+            "title": "Poucos jogos recentes como visitante",
+            "detail": f"{match['time_fora']} possui menos de 3 jogos fora antes desta partida.",
+            "value": away_venue["performance"] if away_venue["matches"] else None,
+            "unit": "%",
+            "sample_size": away_venue["matches"],
+            "available": False,
+        })
+
+    return {
+        "method": "rule_based_historical_signals",
+        "favorite": {
+            "side": favorite_side,
+            "team": favorite_name,
+            "probability": favorite_probability,
+            "sample_size": len(favorite_history) if favorite_side else 0,
+        },
+        "standings": {
+            "season": match.get("temporada"),
+            "home": home_standing,
+            "away": away_standing,
+        },
+        "venue_form": {
+            "home": _summary(home_venue_history),
+            "away": away_venue,
+        },
+        "minute_coverage": {
+            "supported": supports_minutes,
+            "covered": len(favorite_history) - len(missing_match_ids) if favorite_side else 0,
+            "sample_size": len(favorite_history) if favorite_side else 0,
+            "missing_match_ids": missing_match_ids,
+        },
+        "items": items,
+    }
+
+
 def _xg_window(history: list[dict], team_id: int, xg_map: dict, limit: int) -> dict | None:
     rows = [match for match in history[:limit] if int(match["id_api"]) in xg_map]
     if not rows:
@@ -478,6 +694,12 @@ def match_analysis(source: str, match_id: int) -> dict[str, Any]:
     away_history = _perspective(
         database.team_history(source, away_id, kickoff, 10), away_id
     )
+    home_venue_history = _perspective(
+        database.team_history(source, home_id, kickoff, 10, venue="home"), home_id
+    )
+    away_venue_history = _perspective(
+        database.team_history(source, away_id, kickoff, 10, venue="away"), away_id
+    )
     h2h = database.head_to_head(source, home_id, away_id, kickoff, 10)
     prediction = _poisson(home_history, away_history, h2h, home_id, away_id)
     config = database.source_config(source)
@@ -488,6 +710,14 @@ def match_analysis(source: str, match_id: int) -> dict[str, Any]:
     xg_map = database.xg_values(source, history_ids)
     home_temporal = _temporal_profile(home_history, home_id, timeline)
     away_temporal = _temporal_profile(away_history, away_id, timeline)
+    home_first_goal = _first_goal_impact(home_history, home_id, timeline)
+    away_first_goal = _first_goal_impact(away_history, away_id, timeline)
+    standings = database.league_standings_before(
+        source,
+        match["liga_id"],
+        kickoff,
+        match.get("temporada"),
+    )
     return {
         "match": match,
         "prediction": prediction,
@@ -495,14 +725,29 @@ def match_analysis(source: str, match_id: int) -> dict[str, Any]:
         "away": {"summary": _summary(away_history), "history": away_history},
         "head_to_head": h2h,
         "lay_01": _lay_analysis(prediction, home_history, config.supports_minutes),
+        "insights": _intelligent_insights(
+            match,
+            prediction,
+            home_history,
+            away_history,
+            home_venue_history,
+            away_venue_history,
+            home_temporal,
+            away_temporal,
+            home_first_goal,
+            away_first_goal,
+            standings,
+            timeline["covered_match_ids"],
+            config.supports_minutes,
+        ),
         "advanced": {
             "temporal_goals": {
                 "home": home_temporal,
                 "away": away_temporal,
             },
             "first_goal_impact": {
-                "home": _first_goal_impact(home_history, home_id, timeline),
-                "away": _first_goal_impact(away_history, away_id, timeline),
+                "home": home_first_goal,
+                "away": away_first_goal,
             },
             "trading_metrics": {
                 "home": _trading_metrics(home_history, home_temporal),

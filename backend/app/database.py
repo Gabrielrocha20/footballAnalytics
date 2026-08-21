@@ -308,8 +308,51 @@ def get_match(source: str, match_id: int) -> dict | None:
 
 
 def team_history(
-    source: str, team_id: int, before_date: str, limit: int = 10
+    source: str,
+    team_id: int,
+    before_date: str,
+    limit: int = 10,
+    venue: str | None = None,
 ) -> list[dict]:
+    config = source_config(source)
+    if venue not in {None, "home", "away"}:
+        raise ValueError("Mando inválido. Use home ou away")
+    with connect(source) as conn:
+        if config.date_kind == "epoch":
+            before_value: Any = int(
+                datetime.fromisoformat(before_date.replace("Z", "+00:00")).timestamp()
+            )
+            before_sql = "p.data_partida < ?"
+        else:
+            before_value = before_date
+            before_sql = "datetime(p.data_partida) < datetime(?)"
+        team_clause = {
+            "home": "p.time_casa_id=?",
+            "away": "p.time_fora_id=?",
+        }.get(venue, "(p.time_casa_id=? OR p.time_fora_id=?)")
+        team_params = [team_id] if venue else [team_id, team_id]
+        rows = conn.execute(
+            f"""
+            SELECT {_match_select(conn)}
+            FROM partidas p {_details_join(conn)}
+            WHERE p.gols_casa IS NOT NULL
+              AND {team_clause}
+              AND {before_sql}
+            ORDER BY p.data_partida DESC
+            LIMIT ?
+            """,
+            (*team_params, before_value, limit),
+        ).fetchall()
+    return [serialize_match(row, source) for row in rows]
+
+
+def league_standings_before(
+    source: str,
+    league_id: str,
+    before_date: str,
+    season: int | None = None,
+) -> list[dict]:
+    """Calcula a classificação sem usar resultados posteriores ao jogo."""
     config = source_config(source)
     with connect(source) as conn:
         if config.date_kind == "epoch":
@@ -320,19 +363,25 @@ def team_history(
         else:
             before_value = before_date
             before_sql = "datetime(p.data_partida) < datetime(?)"
+        clauses = [
+            f"CAST(p.{config.league_column} AS TEXT)=?",
+            "p.gols_casa IS NOT NULL",
+            before_sql,
+        ]
+        params: list[Any] = [str(league_id), before_value]
+        if season is not None:
+            clauses.append("p.temporada=?")
+            params.append(season)
         rows = conn.execute(
             f"""
             SELECT {_match_select(conn)}
             FROM partidas p {_details_join(conn)}
-            WHERE p.gols_casa IS NOT NULL
-              AND (p.time_casa_id=? OR p.time_fora_id=?)
-              AND {before_sql}
-            ORDER BY p.data_partida DESC
-            LIMIT ?
+            WHERE {' AND '.join(clauses)}
+            ORDER BY p.data_partida ASC
             """,
-            (team_id, team_id, before_value, limit),
+            params,
         ).fetchall()
-    return [serialize_match(row, source) for row in rows]
+    return compute_standings([serialize_match(row, source) for row in rows])
 
 
 def head_to_head(

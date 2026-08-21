@@ -55,9 +55,11 @@ docker compose up -d --build
 ```
 
 A mesma instância entrega frontend e backend em `http://IP_DA_VPS:8000`.
-O volume `tradefot-data` mantém os três bancos entre recriações do container.
-Na primeira execução, os bancos distribuídos no projeto são copiados para o
-volume se ele estiver vazio.
+A pasta `data/` ao lado do `compose.yaml` é montada como `/data` e mantém os
+três bancos e os modelos entre recriações do container. Na primeira execução,
+os bancos distribuídos no projeto são copiados para essa pasta se ela estiver
+vazia. `data/` fica fora do Git para que os dados de produção não sejam
+publicados junto com o código.
 
 Exemplo de proxy reverso Nginx usando uma única origem:
 

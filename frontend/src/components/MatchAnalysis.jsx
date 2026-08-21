@@ -1,4 +1,15 @@
-import { CheckCircle2, XCircle, Clock, HelpCircle, Ban } from 'lucide-react'
+import {
+  Ban,
+  BrainCircuit,
+  CheckCircle2,
+  Clock,
+  Crosshair,
+  HelpCircle,
+  MapPin,
+  RotateCcw,
+  Timer,
+  XCircle,
+} from 'lucide-react'
 import { formatDate } from '../lib/format.js'
 import { Metric } from './Ui.jsx'
 
@@ -49,7 +60,54 @@ export function ProbabilityBar({ label, value, active }) {
   )
 }
 
-export function LayCard({ lay, onCollect, collecting }) {
+const INSIGHT_ICONS = {
+  first_goal: Crosshair,
+  comeback: RotateCcw,
+  late_goal: Timer,
+  away_form: MapPin,
+}
+
+export function InsightsPanel({ insights }) {
+  if (!insights?.items?.length) return null
+  const favorite = insights.favorite
+  return (
+    <section className="panel insights-panel">
+      <div className="panel-title insights-heading">
+        <div>
+          <span className="eyebrow"><BrainCircuit size={14} /> Análise inteligente</span>
+          <h2>O que os dados dizem sobre este jogo?</h2>
+        </div>
+        {favorite?.team && (
+          <span className="favorite-badge">
+            Favorito do modelo: <strong>{favorite.team}</strong> · {favorite.probability?.toFixed(1)}%
+          </span>
+        )}
+      </div>
+      <div className="insights-grid">
+        {insights.items.map((item) => {
+          const Icon = INSIGHT_ICONS[item.id] || HelpCircle
+          return (
+            <article className={`insight-card ${item.tone}`} key={item.id}>
+              <div className="insight-icon"><Icon size={20} /></div>
+              <div className="insight-copy">
+                <h3>{item.title}</h3>
+                <p>{item.detail}</p>
+              </div>
+              {item.available && item.value != null && (
+                <strong className="insight-value">{item.value}{item.unit}</strong>
+              )}
+            </article>
+          )
+        })}
+      </div>
+      <p className="insights-note">
+        Sinais calculados somente com partidas anteriores ao jogo. Percentuais com eventos dependem da cobertura dos minutos.
+      </p>
+    </section>
+  )
+}
+
+export function LayCard({ lay }) {
   const copy = LAY_COPY[lay.status] || { title: 'INDEFINIDO', text: 'Sem conclusão disponível.' }
   const Icon = copy.icon || HelpCircle
   return (
@@ -74,11 +132,6 @@ export function LayCard({ lay, onCollect, collecting }) {
         <Metric label="Percentual" value={`${lay.percentage}%`} />
         <Metric label="Cobertura" value={`${lay.coverage}/10`} />
       </div>
-      {lay.status === 'pending_minutes' && lay.missing_match_ids?.length > 0 && (
-        <button className="primary-button" disabled={collecting} onClick={onCollect}>
-          {collecting ? 'Coletando…' : `Coletar ${lay.missing_match_ids.length} partidas pendentes`}
-        </button>
-      )}
     </section>
   )
 }
