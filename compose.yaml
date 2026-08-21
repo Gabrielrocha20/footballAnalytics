@@ -4,11 +4,12 @@ services:
     container_name: tradefot
     restart: unless-stopped
     ports:
-      - "127.0.0.1:6000:6000"
+      - "127.0.0.1:6000:8000"
     env_file:
       - .env
     environment:
       TRADEFOT_DATA_DIR: /data
+      PORT: 8000
     volumes:
       - tradefot-data:/data
 
