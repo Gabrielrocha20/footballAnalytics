@@ -63,6 +63,8 @@ export const api = {
     request(`/api/leagues/${encodeURIComponent(leagueId)}${query({ source, season })}`),
   analysis: (source, matchId) =>
     request(`/api/matches/${matchId}/analysis${query({ source })}`),
+  performance: (source, days = 7, limit = 30) =>
+    request(`/api/performance${query({ source, days, limit })}`),
   neuralPrediction: (source, matchId) =>
     request(`/api/matches/${matchId}/prediction${query({ source })}`),
   modelStatus: (source) => request(`/api/models/status${query({ source })}`),

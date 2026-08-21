@@ -84,6 +84,14 @@ def sync_source(source: str, scope: str, progress: Progress) -> dict:
 
 def sync_and_train(source: str, scope: str, progress: Progress) -> dict:
     """Atualiza a fonte e incorpora resultados novos ao modelo neural."""
+    from . import prediction_history
+
+    progress(0, 0, "Congelando análises pré-jogo de hoje")
+    try:
+        snapshots_before = prediction_history.capture_today(source, progress)
+    except Exception as exc:
+        snapshots_before = {"captured": 0, "error": str(exc)}
+
     sync_result = sync_source(source, scope, progress)
     progress(0, 0, "Verificando se o modelo neural precisa ser atualizado")
     try:
@@ -93,7 +101,19 @@ def sync_and_train(source: str, scope: str, progress: Progress) -> dict:
     except Exception as exc:
         # Uma indisponibilidade do modelo não invalida os dados já sincronizados.
         model_result = {"trained": False, "reason": "error", "error": str(exc)}
-    return {"sync": sync_result, "neural_model": model_result}
+    progress(0, 0, "Registrando novos jogos pré-jogo de hoje")
+    try:
+        snapshots_after = prediction_history.capture_today(source, progress)
+    except Exception as exc:
+        snapshots_after = {"captured": 0, "error": str(exc)}
+    return {
+        "sync": sync_result,
+        "neural_model": model_result,
+        "analysis_snapshots": {
+            "before_sync": snapshots_before,
+            "after_sync": snapshots_after,
+        },
+    }
 
 
 def collect_minutes(source: str, match_ids: list[int], progress: Progress) -> dict:

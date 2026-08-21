@@ -720,6 +720,55 @@ Estados possíveis:
 
 ---
 
+## Desempenho das análises
+
+### `GET /api/performance`
+
+Retorna a auditoria das previsões que foram congeladas antes do início das
+partidas. O histórico fica em `TRADEFOT_DATA_DIR/tradefot_history.db` e,
+portanto, persiste junto com os demais bancos no Docker.
+
+Parâmetros:
+
+| Nome | Tipo | Padrão | Limite |
+|---|---|---|---|
+| `source` | string | `onefootball` | fonte cadastrada |
+| `days` | inteiro | `7` | entre 1 e 90 |
+| `limit` | inteiro | `30` | entre 1 e 100 |
+
+Cada partida encerrada avalia separadamente:
+
+- resultado 1X2 mais provável;
+- Mais/Menos 2,5 gols;
+- Ambas Marcam;
+- se o favorito do modelo marcaria;
+- Lay 0x1, quando o sinal estava aprovado e o minuto está disponível.
+
+O primeiro acesso à análise de uma partida futura congela sua fotografia. O
+fluxo de `POST /api/sync` também registra automaticamente todos os jogos
+restantes do dia antes de atualizar os resultados. Depois da sincronização,
+o painel pode comparar a fotografia original com o placar novo sem recalcular
+o passado.
+
+Resposta resumida:
+
+```json
+{
+  "summary": {
+    "snapshots": 18,
+    "evaluated_matches": 12,
+    "pending_matches": 6,
+    "matches_hit": 8,
+    "checks": 48,
+    "hits": 33,
+    "hit_rate": 68.8
+  },
+  "items": []
+}
+```
+
+---
+
 ## Comparação com odds da casa
 
 ### `POST /api/matches/{match_id}/value`

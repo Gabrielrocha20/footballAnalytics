@@ -8,3 +8,4 @@ frontend/dist/
 models/*.npz
 models/*.json
 data/
+tradefot_history.db*

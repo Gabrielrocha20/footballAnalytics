@@ -4,6 +4,7 @@ import { Search, X, ChevronLeft, ChevronRight, Trophy } from 'lucide-react'
 import { api } from '../lib/api.js'
 import { SOURCE_NAMES } from '../lib/format.js'
 import { MatchCard } from '../components/MatchCard.jsx'
+import { PerformancePanel } from '../components/PerformancePanel.jsx'
 import { Loading, ErrorCard, EmptyState } from '../components/Ui.jsx'
 
 const PAGE_SIZE = 24
@@ -16,6 +17,7 @@ export function Home({ source, sources }) {
   const [data, setData] = useState(null)
   const [foundLeagues, setFoundLeagues] = useState([])
   const [spotlight, setSpotlight] = useState([])
+  const [performance, setPerformance] = useState(null)
   const [error, setError] = useState(null)
 
   const selectedSource = sources.find((item) => item.key === source)
@@ -23,10 +25,12 @@ export function Home({ source, sources }) {
   useEffect(() => {
     setPage(1)
     setLeagueFilter(null)
+    setPerformance(null)
     api
       .leagues(source, '')
       .then((all) => setSpotlight([...all].sort((a, b) => (b.matches || 0) - (a.matches || 0)).slice(0, 8)))
       .catch(() => setSpotlight([]))
+    api.performance(source, 7, 12).then(setPerformance).catch(() => setPerformance(null))
   }, [source])
 
   useEffect(() => {
@@ -86,6 +90,8 @@ export function Home({ source, sources }) {
           <small>partidas em {selectedSource?.leagues || '—'} ligas</small>
         </div>
       </section>
+
+      <PerformancePanel data={performance} source={source} />
 
       <form className="search-bar" onSubmit={submit}>
         <Search size={19} />

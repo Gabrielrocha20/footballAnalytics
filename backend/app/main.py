@@ -9,7 +9,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, collectors, database, neural_model
+from . import analytics, collectors, database, neural_model, prediction_history
 from .auth import (
     COOKIE_NAME,
     authentication_configured,
@@ -181,7 +181,22 @@ def league_detail(
 
 @app.get("/api/matches/{match_id}/analysis", dependencies=[Depends(require_access)])
 def match_analysis(match_id: int, source: str = Query("onefootball")):
-    return _data_call(lambda: analytics.match_analysis(source, match_id))
+    result = _data_call(lambda: analytics.match_analysis(source, match_id))
+    try:
+        prediction_history.save_source_analysis(source, result)
+    except Exception:
+        # O histórico de auditoria não deve impedir a exibição da análise.
+        pass
+    return result
+
+
+@app.get("/api/performance", dependencies=[Depends(require_access)])
+def analysis_performance(
+    source: str = Query("onefootball"),
+    days: int = Query(7, ge=1, le=90),
+    limit: int = Query(30, ge=1, le=100),
+):
+    return _data_call(lambda: prediction_history.performance(source, days, limit))
 
 
 @app.post("/api/matches/{match_id}/value", dependencies=[Depends(require_access)])
