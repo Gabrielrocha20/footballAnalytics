@@ -1,0 +1,16 @@
+services:
+  tradefot:
+    build: .
+    container_name: tradefot
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      TRADEFOT_DATA_DIR: /data
+    volumes:
+      - tradefot-data:/data
+
+volumes:
+  tradefot-data:

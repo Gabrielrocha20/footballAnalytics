@@ -2,8 +2,9 @@
 Sofascore scraper — selenium + webdriver-manager (headless).
 
 Modos:
-  python sofascore_scraper.py          → coleta inicial completa
-  python sofascore_scraper.py --update → só atualiza resultados de jogos que já aconteceram
+  python main2.py          → atualização incremental se o banco já tiver dados
+  python main2.py --update → força a atualização incremental
+  python main2.py --full   → refaz a descoberta completa de países e torneios
 """
 
 import json
@@ -22,23 +23,33 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
+# Garante que os emojis das mensagens funcionem em terminais Windows legados.
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Config ────────────────────────────────────────────────────
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-DB_PATH    = os.path.join(BASE_DIR, "futebol.db")
+DB_PATH    = os.getenv("SOFASCORE_DB_PATH", os.path.join(BASE_DIR, "futebol.db"))
 DELAY      = 0.4
 BASE       = "https://www.sofascore.com/api/v1"
 ANO_MINIMO = datetime.now().year
 MODO_UPDATE = "--update" in sys.argv
+MODO_GOLS = "--goal-ids" in sys.argv
+MODO_FULL = "--full" in sys.argv
 
 
 # ── Driver ────────────────────────────────────────────────────
 def criar_driver() -> webdriver.Chrome:
     options = Options()
-    for p in [
+    configured_binary = os.getenv("CHROME_BIN")
+    candidates = [configured_binary] if configured_binary else []
+    candidates.extend([
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-    ]:
+    ])
+    for p in candidates:
         if os.path.exists(p):
             options.binary_location = p
             break
@@ -51,7 +62,8 @@ def criar_driver() -> webdriver.Chrome:
     options.add_argument("--log-level=3")
 
     log_path = os.path.join(tempfile.gettempdir(), "chromedriver_sofascore.log")
-    service  = Service(ChromeDriverManager().install(), log_output=log_path)
+    driver_path = os.getenv("CHROMEDRIVER") or ChromeDriverManager().install()
+    service  = Service(driver_path, log_output=log_path)
     return webdriver.Chrome(service=service, options=options)
 
 
@@ -96,6 +108,31 @@ CREATE TABLE IF NOT EXISTS ligas_coletadas (
     liga_id      INTEGER,
     temporada_id INTEGER,
     PRIMARY KEY (liga_id, temporada_id)
+);
+CREATE TABLE IF NOT EXISTS partidas_detalhes (
+    id_api INTEGER PRIMARY KEY,
+    coletado_em TEXT NOT NULL,
+    gols_casa_ate_75 INTEGER NOT NULL,
+    gols_fora_ate_75 INTEGER NOT NULL,
+    primeiro_gol_casa_minuto INTEGER,
+    primeiro_gol_fora_minuto INTEGER,
+    total_gols_incidentes INTEGER NOT NULL,
+    FOREIGN KEY (id_api) REFERENCES partidas(id_api)
+);
+CREATE TABLE IF NOT EXISTS eventos_partida (
+    id_api INTEGER NOT NULL,
+    evento_ordem INTEGER NOT NULL,
+    minuto INTEGER,
+    minuto_texto TEXT,
+    lado TEXT,
+    tipo TEXT,
+    subtipo TEXT,
+    jogador TEXT,
+    assistente TEXT,
+    jogador_entra TEXT,
+    jogador_sai TEXT,
+    PRIMARY KEY (id_api, evento_ordem),
+    FOREIGN KEY (id_api) REFERENCES partidas(id_api)
 );
 """)
 conn.commit()
@@ -144,11 +181,27 @@ def salvar_eventos(eventos: list, liga_id, liga_nome, liga_pais, temp_id, temp_a
         ))
     if registros:
         cursor.executemany("""
-        INSERT OR IGNORE INTO partidas
+        INSERT INTO partidas
             (id_api, liga_id, liga_nome, liga_pais, temporada_id, temporada,
              rodada, data_partida, status, time_casa_id, time_casa,
              time_fora_id, time_fora, gols_casa, gols_fora, vencedor)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id_api) DO UPDATE SET
+            liga_id=excluded.liga_id,
+            liga_nome=excluded.liga_nome,
+            liga_pais=excluded.liga_pais,
+            temporada_id=excluded.temporada_id,
+            temporada=excluded.temporada,
+            rodada=excluded.rodada,
+            data_partida=excluded.data_partida,
+            status=excluded.status,
+            time_casa_id=excluded.time_casa_id,
+            time_casa=excluded.time_casa,
+            time_fora_id=excluded.time_fora_id,
+            time_fora=excluded.time_fora,
+            gols_casa=COALESCE(excluded.gols_casa, partidas.gols_casa),
+            gols_fora=COALESCE(excluded.gols_fora, partidas.gols_fora),
+            vencedor=COALESCE(excluded.vencedor, partidas.vencedor)
         """, registros)
         conn.commit()
     return len(registros)
@@ -165,58 +218,236 @@ def atualizar_resultado(id_api, gc, gf_, status):
     return cursor.rowcount  # 1 se atualizou, 0 se já tinha resultado
 
 
+def banco_tem_dados():
+    cursor.execute("SELECT 1 FROM partidas LIMIT 1")
+    return cursor.fetchone() is not None
+
+
+def coletar_minutos_gols(driver, ids_partidas):
+    """Coleta e armazena os gols ocorridos até o minuto 75 de partidas específicas."""
+    ids = list(dict.fromkeys(int(match_id) for match_id in ids_partidas))
+    total = len(ids)
+    concluidas = 0
+    erros = 0
+
+    for indice, match_id in enumerate(ids, start=1):
+        print(f"[GOLS {indice}/{total}] Partida {match_id}", flush=True)
+        data = None
+        forbidden = False
+        for attempt in range(3):
+            candidate = get_json(driver, f"{BASE}/event/{match_id}/incidents")
+            if candidate and "incidents" in candidate:
+                data = candidate
+                break
+            if candidate and candidate.get("error"):
+                print(f"  Tentativa {attempt + 1}: {candidate['error']}", flush=True)
+                forbidden = candidate["error"].get("code") == 403
+            driver.get("https://www.sofascore.com/pt/football")
+            time.sleep(2 + attempt)
+        if not data or "incidents" not in data:
+            erros += 1
+            if forbidden:
+                restantes = total - indice
+                erros += restantes
+                print(
+                    "  SofaScore bloqueou temporariamente os incidentes (HTTP 403). "
+                    "Aguarde o coletor principal terminar e tente novamente mais tarde.",
+                    flush=True,
+                )
+                break
+            continue
+
+        goals = [
+            incident
+            for incident in data.get("incidents", [])
+            if incident.get("incidentType") == "goal"
+            and incident.get("incidentClass") != "missed"
+        ]
+        goals.sort(key=lambda goal: (int(goal.get("time", 999)), int(goal.get("addedTime") or 0)))
+
+        def goal_minute(goal):
+            return int(goal.get("time", 999)) + int(goal.get("addedTime") or 0)
+
+        home_minutes = [
+            goal_minute(goal)
+            for goal in goals
+            if goal.get("isHome") is True and goal_minute(goal) <= 75
+        ]
+        away_minutes = [
+            goal_minute(goal)
+            for goal in goals
+            if goal.get("isHome") is False and goal_minute(goal) <= 75
+        ]
+        cursor.execute("DELETE FROM eventos_partida WHERE id_api=?", (match_id,))
+        cursor.executemany(
+            """
+            INSERT INTO eventos_partida (
+                id_api, evento_ordem, minuto, minuto_texto, lado, tipo,
+                subtipo, jogador, assistente, jogador_entra, jogador_sai
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+            """,
+            [
+                (
+                    match_id,
+                    order,
+                    goal_minute(goal),
+                    (
+                        f"{int(goal.get('time', 0))}+{int(goal.get('addedTime'))}"
+                        if goal.get("addedTime")
+                        else str(int(goal.get("time", 0)))
+                    ),
+                    "HOME" if goal.get("isHome") is True else "AWAY",
+                    "goal",
+                    str(goal.get("incidentClass") or ""),
+                    (goal.get("player") or {}).get("name"),
+                    (goal.get("assist1") or {}).get("name"),
+                )
+                for order, goal in enumerate(goals)
+            ],
+        )
+        cursor.execute(
+            """
+            INSERT INTO partidas_detalhes (
+                id_api, coletado_em, gols_casa_ate_75, gols_fora_ate_75,
+                primeiro_gol_casa_minuto, primeiro_gol_fora_minuto,
+                total_gols_incidentes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id_api) DO UPDATE SET
+                coletado_em=excluded.coletado_em,
+                gols_casa_ate_75=excluded.gols_casa_ate_75,
+                gols_fora_ate_75=excluded.gols_fora_ate_75,
+                primeiro_gol_casa_minuto=excluded.primeiro_gol_casa_minuto,
+                primeiro_gol_fora_minuto=excluded.primeiro_gol_fora_minuto,
+                total_gols_incidentes=excluded.total_gols_incidentes
+            """,
+            (
+                match_id,
+                datetime.now().isoformat(timespec="seconds"),
+                len(home_minutes),
+                len(away_minutes),
+                min(home_minutes) if home_minutes else None,
+                min(away_minutes) if away_minutes else None,
+                len(goals),
+            ),
+        )
+        conn.commit()
+        concluidas += 1
+        time.sleep(max(DELAY, 1.0))
+
+    print(
+        f"MINUTOS_GOLS_RESULTADO concluidas={concluidas} erros={erros} total={total}",
+        flush=True,
+    )
+
+
 # ── Modo atualização ──────────────────────────────────────────
 def modo_update(driver):
     """
-    Busca partidas no banco sem resultado (gols_casa IS NULL)
-    cujo timestamp já passou, e tenta buscar o resultado via API.
-    Agrupa por liga+temporada para minimizar requests.
+    Sincronização incremental baseada somente nas ligas/temporadas do banco.
+
+    - atualiza placares que já deveriam ter terminado;
+    - atualiza datas/status e inclui novos jogos das ligas com partidas nos
+      próximos 21 dias;
+    - não refaz a varredura mundial de categorias e torneios.
     """
     agora = int(datetime.now().timestamp())
+    horizonte = agora + 21 * 24 * 60 * 60
 
     cursor.execute("""
-        SELECT DISTINCT liga_id, temporada_id, liga_nome, liga_pais
+        SELECT
+            liga_id, temporada_id, liga_nome, liga_pais, temporada,
+            MAX(CASE WHEN gols_casa IS NULL AND data_partida < ? THEN 1 ELSE 0 END) AS tem_pendente,
+            MAX(CASE WHEN gols_casa IS NULL AND data_partida BETWEEN ? AND ? THEN 1 ELSE 0 END) AS tem_proximo
         FROM partidas
-        WHERE gols_casa IS NULL AND data_partida < ?
-    """, (agora,))
-    ligas_pendentes = cursor.fetchall()
+        GROUP BY liga_id, temporada_id, liga_nome, liga_pais, temporada
+        HAVING tem_pendente = 1 OR tem_proximo = 1
+        ORDER BY tem_pendente DESC, liga_nome
+    """, (agora, agora, horizonte))
+    ligas_ativas = cursor.fetchall()
 
-    if not ligas_pendentes:
-        print("✅ Nenhuma partida pendente de resultado.")
+    if not ligas_ativas:
+        print("✅ Nenhuma liga precisa de sincronização neste momento.")
         return
 
-    print(f"🔄 {len(ligas_pendentes)} liga(s) com jogos para atualizar...\n")
-    total_atualizados = 0
+    print(
+        f"🔄 Sincronização incremental de {len(ligas_ativas)} liga/temporada(s).\n"
+        "   Nenhuma busca de países ou catálogo completo será feita.\n"
+    )
+    total_sincronizados = 0
+    total_resultados = 0
+    falhas = 0
 
-    for liga_id, temp_id, liga_nome, liga_pais in ligas_pendentes:
-        print(f"  Atualizando {liga_nome} ({liga_pais}) ... ", end="", flush=True)
-        atualizados = 0
+    for indice, (
+        liga_id, temp_id, liga_nome, liga_pais, temp_ano, tem_pendente, tem_proximo
+    ) in enumerate(ligas_ativas, start=1):
+        print(
+            f"[{indice}/{len(ligas_ativas)}] {liga_nome} ({liga_pais}) ... ",
+            end="",
+            flush=True,
+        )
+        sincronizados = 0
+        resultados_antes = conn.total_changes
 
-        # Busca páginas de jogos passados até não ter mais pendentes dessa liga
-        for pagina in range(50):
+        if tem_pendente:
+            cursor.execute(
+                """
+                SELECT id_api FROM partidas
+                WHERE liga_id=? AND temporada_id=?
+                  AND gols_casa IS NULL AND data_partida < ?
+                """,
+                (liga_id, temp_id, agora),
+            )
+            pending_ids = {row[0] for row in cursor.fetchall()}
+
+            for pagina in range(20):
+                data = get_json(
+                    driver,
+                    f"{BASE}/unique-tournament/{liga_id}/season/{temp_id}/events/last/{pagina}",
+                )
+                time.sleep(DELAY)
+                if not data or not data.get("events"):
+                    if pagina == 0:
+                        falhas += 1
+                    break
+
+                sincronizados += salvar_eventos(
+                    data["events"], liga_id, liga_nome, liga_pais, temp_id, temp_ano
+                )
+                returned_ids = {event["id"] for event in data["events"]}
+                pending_ids -= returned_ids
+                if not pending_ids or not data.get("hasNextPage", False):
+                    break
+
+        if tem_proximo:
+            # A primeira página contém os jogos futuros mais próximos. O upsert
+            # corrige adiamentos, horários/status e inclui partidas novas.
             data = get_json(
                 driver,
-                f"{BASE}/unique-tournament/{liga_id}/season/{temp_id}/events/last/{pagina}"
+                f"{BASE}/unique-tournament/{liga_id}/season/{temp_id}/events/next/0",
             )
             time.sleep(DELAY)
-            if not data or not data.get("events"):
-                break
+            if data and data.get("events"):
+                sincronizados += salvar_eventos(
+                    data["events"], liga_id, liga_nome, liga_pais, temp_id, temp_ano
+                )
+            else:
+                falhas += 1
 
-            for e in data["events"]:
-                gc  = e.get("homeScore", {}).get("current")
-                gf_ = e.get("awayScore", {}).get("current")
-                if gc is None:
-                    continue
-                status = e.get("status", {}).get("description", "")
-                atualizados += atualizar_resultado(e["id"], gc, gf_, status)
+        changes = conn.total_changes - resultados_antes
+        print(f"{sincronizados} recebidos · {changes} registros sincronizados")
+        total_sincronizados += sincronizados
+        total_resultados += changes
 
-            if not data.get("hasNextPage", False):
-                break
-
-        print(f"{atualizados} atualizados ✅" if atualizados else "nada novo")
-        total_atualizados += atualizados
-
-    print(f"\n✅ Total de resultados atualizados: {total_atualizados}")
+    print()
+    print("=" * 60)
+    print(f"Ligas/temporadas consultadas : {len(ligas_ativas)}")
+    print(f"Eventos recebidos            : {total_sincronizados}")
+    print(f"Registros sincronizados      : {total_resultados}")
+    print(f"Consultas sem resposta       : {falhas}")
+    print("Modo                         : incremental")
+    print("=" * 60)
+    # Mantém compatibilidade com o resumo lido pelo app.py.
+    print(f"Total de resultados atualizados: {total_resultados}")
 
 
 # ── Coleta inicial ────────────────────────────────────────────
@@ -342,8 +573,15 @@ def modo_coleta(driver):
 
 # ── Entry point ───────────────────────────────────────────────
 if __name__ == "__main__":
+    usar_coleta_completa = MODO_FULL or not banco_tem_dados()
+    if MODO_GOLS:
+        modo_nome = "MINUTOS DOS GOLS"
+    elif usar_coleta_completa:
+        modo_nome = "COLETA COMPLETA"
+    else:
+        modo_nome = "ATUALIZAÇÃO INCREMENTAL"
     print("=" * 60)
-    print("SOFASCORE SCRAPER —", "MODO UPDATE" if MODO_UPDATE else "COLETA INICIAL")
+    print("SOFASCORE SCRAPER —", modo_nome)
     print("=" * 60)
 
     print("\n[INIT] Iniciando Chrome headless...")
@@ -351,7 +589,17 @@ if __name__ == "__main__":
     print("[INIT] Chrome iniciado!\n")
 
     try:
-        if MODO_UPDATE:
+        if MODO_GOLS:
+            try:
+                position = sys.argv.index("--goal-ids")
+                ids_argument = sys.argv[position + 1]
+                ids_partidas = [value for value in ids_argument.split(",") if value.strip()]
+            except (ValueError, IndexError):
+                raise SystemExit("Informe --goal-ids ID1,ID2,...")
+            driver.get("https://www.sofascore.com/pt/football")
+            time.sleep(2)
+            coletar_minutos_gols(driver, ids_partidas)
+        elif not usar_coleta_completa:
             # Warm-up rápido antes do update
             driver.get("https://www.sofascore.com/pt/football")
             time.sleep(2)

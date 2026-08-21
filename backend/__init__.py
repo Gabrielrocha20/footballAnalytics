@@ -1,0 +1,1 @@
+"""Backend HTTP do TradeFot."""

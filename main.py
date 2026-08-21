@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "futebol2.db"
+DB_PATH = Path(os.getenv("FOOTBALL_DATA_DB_PATH", BASE_DIR / "futebol2.db"))
 API_URL = "https://api.football-data.org/v4"
 
 LIGAS_TEMPORADAS = {
@@ -33,7 +33,21 @@ def _token_api() -> str:
         raise RuntimeError(
             "Token da API não encontrado. Defina FOOTBALL_DATA_TOKEN (ou API) no arquivo .env."
         )
-    return token
+    return token.strip().strip('"').strip("'")
+
+
+def _validar_resposta(response: requests.Response) -> None:
+    """Preserva a mensagem JSON da API, especialmente nos erros 400."""
+    if response.ok:
+        return
+    try:
+        payload = response.json()
+        detail = payload.get("message") or payload.get("error") or str(payload)
+    except ValueError:
+        detail = response.text[:300] or response.reason
+    raise requests.HTTPError(
+        f"HTTP {response.status_code}: {detail}", response=response
+    )
 
 
 def _criar_tabela(conn: sqlite3.Connection) -> None:
@@ -68,21 +82,40 @@ def atualizar_dados(
     ``progresso`` recebe (etapa_atual, total_etapas, mensagem), permitindo que
     o app mostre uma barra sem acoplar este módulo ao Streamlit.
     """
-    tarefas = [
-        (liga, temporada)
-        for liga, temporadas in LIGAS_TEMPORADAS.items()
-        for temporada in temporadas
-    ]
+    tarefas = []
+    erros_descoberta = []
+    headers = {"X-Auth-Token": _token_api()}
+    with requests.Session() as discovery_session:
+        for league_index, (liga, fallback_seasons) in enumerate(LIGAS_TEMPORADAS.items()):
+            if progresso:
+                progresso(league_index, len(LIGAS_TEMPORADAS), f"Validando temporadas de {liga}")
+            try:
+                response = discovery_session.get(
+                    f"{API_URL}/competitions/{liga}", headers=headers, timeout=30
+                )
+                _validar_resposta(response)
+                available = []
+                for season in response.json().get("seasons", []):
+                    start_date = season.get("startDate", "")
+                    if len(start_date) >= 4 and start_date[:4].isdigit():
+                        available.append(int(start_date[:4]))
+                seasons = sorted(set(available), reverse=True)[:2] or fallback_seasons
+            except (requests.RequestException, ValueError) as exc:
+                seasons = fallback_seasons
+                erros_descoberta.append(f"{liga} (temporadas): {exc}")
+            tarefas.extend((liga, season) for season in seasons)
+            if league_index < len(LIGAS_TEMPORADAS) - 1 and intervalo:
+                time.sleep(intervalo)
+
     resumo = {
         "consultas": len(tarefas),
         "concluidas": 0,
         "recebidas": 0,
         "inseridas": 0,
         "atualizadas": 0,
-        "erros": [],
+        "erros": erros_descoberta,
     }
 
-    headers = {"X-Auth-Token": _token_api()}
     conn = sqlite3.connect(str(db_path), timeout=30)
     _criar_tabela(conn)
 
@@ -110,7 +143,7 @@ def atualizar_dados(
                             params={"season": temporada},
                             timeout=30,
                         )
-                    resposta.raise_for_status()
+                    _validar_resposta(resposta)
 
                     partidas = resposta.json().get("matches", [])
                     ids = [partida["id"] for partida in partidas]

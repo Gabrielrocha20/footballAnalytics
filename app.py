@@ -131,6 +131,11 @@ DB_SOURCES = {
         "arquivo": "futebol.db",
         "descricao": "Catálogo amplo de ligas · coletado pelo main2.py",
     },
+    "onefootball": {
+        "nome": "OneFootball",
+        "arquivo": "futebol3.db",
+        "descricao": "429 competições · calendário, resultados, tabela e minutos",
+    },
 }
 
 @st.cache_data(ttl=60)
@@ -143,7 +148,22 @@ def load_data(db_path):
         ).fetchone()
         if not table_exists:
             return pd.DataFrame()
-        df = pd.read_sql("SELECT * FROM partidas", conn)
+        details_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='partidas_detalhes'"
+        ).fetchone()
+        if details_exists:
+            df = pd.read_sql(
+                """
+                SELECT p.*, d.gols_casa_ate_75, d.gols_fora_ate_75,
+                       d.primeiro_gol_casa_minuto, d.primeiro_gol_fora_minuto,
+                       d.coletado_em AS minutos_coletados_em
+                FROM partidas p
+                LEFT JOIN partidas_detalhes d ON d.id_api = p.id_api
+                """,
+                conn,
+            )
+        else:
+            df = pd.read_sql("SELECT * FROM partidas", conn)
 
     if "liga_codigo" not in df.columns:
         df["liga_codigo"] = "SOFA_" + df["liga_id"].astype("Int64").astype(str)
@@ -162,6 +182,30 @@ def load_data(db_path):
     if "rodada" not in df.columns:
         df["rodada"] = ""
     return df
+
+
+@st.cache_data(ttl=60)
+def load_official_standings(db_path, league_id):
+    if not os.path.exists(db_path):
+        return pd.DataFrame()
+    with sqlite3.connect(db_path, timeout=30) as conn:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='classificacao'"
+        ).fetchone()
+        if not table_exists:
+            return pd.DataFrame()
+        return pd.read_sql(
+            """
+            SELECT posicao AS Pos, time_nome AS Time, jogos AS J,
+                   vitorias AS V, empates AS E, derrotas AS D,
+                   saldo_gols AS SG, pontos AS Pts
+            FROM classificacao
+            WHERE liga_id=?
+            ORDER BY posicao, time_nome
+            """,
+            conn,
+            params=(int(league_id),),
+        ).set_index("Pos")
 
 
 def database_label(source_key):
@@ -218,6 +262,171 @@ def atualizar_sofascore(progresso=None):
         "erros": [],
         "detalhes": output_lines[-8:],
     }
+
+
+def atualizar_onefootball(progresso=None, full=False):
+    """Executa o coletor OneFootball sem bloquear a atualização visual do app."""
+    db_path = os.path.join(BASE_DIR, DB_SOURCES["onefootball"]["arquivo"])
+    has_data = False
+    if os.path.exists(db_path):
+        try:
+            with sqlite3.connect(db_path, timeout=2) as conn:
+                has_data = conn.execute(
+                    "SELECT COUNT(*) FROM partidas"
+                ).fetchone()[0] > 0
+        except sqlite3.Error:
+            pass
+
+    command = [sys.executable, "-u", os.path.join(BASE_DIR, "main3.py")]
+    command.append("--full" if full or not has_data else "--update")
+    process = subprocess.Popen(
+        command,
+        cwd=BASE_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    output_lines = []
+    if process.stdout:
+        for line in process.stdout:
+            clean_line = line.strip()
+            if not clean_line:
+                continue
+            output_lines.append(clean_line)
+            match = re.search(r"\[(\d+)/(\d+)\]\s*(.+)", clean_line)
+            if match and progresso:
+                progresso(int(match.group(1)), int(match.group(2)), match.group(3)[-120:])
+    return_code = process.wait()
+    output = "\n".join(output_lines)
+    if return_code != 0:
+        detail = "\n".join(output_lines[-8:]) or "O main3.py terminou sem mensagem."
+        raise RuntimeError(f"Falha ao atualizar pelo OneFootball:\n{detail}")
+
+    result_match = re.search(
+        r"ONEFOOTBALL_RESULTADO consultas=(\d+) concluidas=(\d+) "
+        r"recebidas=(\d+) inseridas=(\d+) atualizadas=(\d+) erros=(\d+)",
+        output,
+    )
+    if not result_match:
+        raise RuntimeError("O coletor OneFootball não retornou um resumo válido.")
+    consultas, concluidas, recebidas, inseridas, atualizadas, erros = map(
+        int, result_match.groups()
+    )
+    if progresso:
+        progresso(consultas, consultas, "Sincronização OneFootball concluída")
+    error_lines = [line.removeprefix("ERRO ") for line in output_lines if line.startswith("ERRO ")]
+    return {
+        "consultas": consultas,
+        "concluidas": concluidas,
+        "recebidas": recebidas,
+        "inseridas": inseridas,
+        "atualizadas": atualizadas,
+        "erros": error_lines or ([f"{erros} consulta(s) falharam"] if erros else []),
+        "detalhes": output_lines[-8:],
+    }
+
+
+def coletar_minutos_sofascore(match_ids, progresso=None):
+    ids = list(dict.fromkeys(int(match_id) for match_id in match_ids))
+    if not ids:
+        return {"concluidas": 0, "erros": 0, "total": 0}
+    command = [
+        sys.executable,
+        "-u",
+        os.path.join(BASE_DIR, "main2.py"),
+        "--goal-ids",
+        ",".join(map(str, ids)),
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=BASE_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    output_lines = []
+    if process.stdout:
+        for line in process.stdout:
+            clean_line = line.strip()
+            if not clean_line:
+                continue
+            output_lines.append(clean_line)
+            match = re.search(r"\[GOLS\s+(\d+)/(\d+)\]", clean_line)
+            if match and progresso:
+                progresso(int(match.group(1)) - 1, int(match.group(2)), clean_line)
+    return_code = process.wait()
+    output = "\n".join(output_lines)
+    if return_code != 0:
+        detail = "\n".join(output_lines[-8:]) or "O coletor terminou sem mensagem."
+        raise RuntimeError(f"Falha ao coletar os minutos dos gols:\n{detail}")
+    result_match = re.search(
+        r"MINUTOS_GOLS_RESULTADO concluidas=(\d+) erros=(\d+) total=(\d+)", output
+    )
+    if not result_match:
+        raise RuntimeError("O coletor não retornou o resumo dos minutos dos gols.")
+    result = {
+        "concluidas": int(result_match.group(1)),
+        "erros": int(result_match.group(2)),
+        "total": int(result_match.group(3)),
+    }
+    if progresso:
+        progresso(result["total"], result["total"], "Minutos dos gols atualizados")
+    return result
+
+
+def coletar_minutos_onefootball(match_ids, progresso=None):
+    ids = list(dict.fromkeys(int(match_id) for match_id in match_ids))
+    if not ids:
+        return {"concluidas": 0, "erros": 0, "total": 0}
+    command = [
+        sys.executable,
+        "-u",
+        os.path.join(BASE_DIR, "main3.py"),
+        "--goal-ids",
+        ",".join(map(str, ids)),
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=BASE_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    output_lines = []
+    if process.stdout:
+        for line in process.stdout:
+            clean_line = line.strip()
+            if not clean_line:
+                continue
+            output_lines.append(clean_line)
+            match = re.search(r"\[GOLS\s+(\d+)/(\d+)\]", clean_line)
+            if match and progresso:
+                progresso(int(match.group(1)) - 1, int(match.group(2)), clean_line)
+    return_code = process.wait()
+    output = "\n".join(output_lines)
+    if return_code != 0:
+        detail = "\n".join(output_lines[-8:]) or "O main3.py terminou sem mensagem."
+        raise RuntimeError(f"Falha ao coletar os minutos no OneFootball:\n{detail}")
+    result_match = re.search(
+        r"ONEFOOTBALL_GOLS_RESULTADO concluidas=(\d+) erros=(\d+) total=(\d+)",
+        output,
+    )
+    if not result_match:
+        raise RuntimeError("O coletor OneFootball não retornou o resumo dos minutos.")
+    result = {
+        "concluidas": int(result_match.group(1)),
+        "erros": int(result_match.group(2)),
+        "total": int(result_match.group(3)),
+    }
+    if progresso:
+        progresso(result["total"], result["total"], "Minutos OneFootball atualizados")
+    return result
 
 
 def normalize_search(value):
@@ -395,6 +604,206 @@ def poisson_prediction(home_games, away_games, h2h, home_id, away_id):
     }
 
 
+def goal_75_history(team_games, team_id):
+    """Lê gols do time até 75' na ordem dos jogos recebidos."""
+    records = []
+    for _, history_match in team_games.iterrows():
+        at_home = history_match["time_casa_id"] == team_id
+        goal_column = "gols_casa_ate_75" if at_home else "gols_fora_ate_75"
+        minute_column = (
+            "primeiro_gol_casa_minuto" if at_home else "primeiro_gol_fora_minuto"
+        )
+        value = history_match.get(goal_column, pd.NA)
+        first_minute = history_match.get(minute_column, pd.NA)
+        records.append(
+            {
+                "id_api": int(history_match["id_api"]),
+                "goals": None if pd.isna(value) else int(value),
+                "first_minute": None if pd.isna(first_minute) else int(first_minute),
+                "match": history_match,
+            }
+        )
+    return records
+
+
+def build_lay_01_candidates(all_data, league_data):
+    """Seleciona mandantes favoritos e mede gols marcados até 75' nos 10 jogos anteriores."""
+    now = pd.Timestamp.now(tz="UTC")
+    upcoming = league_data[
+        league_data["gols_casa"].isna() & (league_data["data_partida"] >= now)
+    ].sort_values("data_partida")
+    if "status" in upcoming.columns:
+        upcoming = upcoming[
+            ~upcoming["status"].fillna("").str.casefold().isin(
+                ["canceled", "cancelled", "abandoned", "walkover"]
+            )
+        ]
+
+    rows = []
+    for _, match in upcoming.iterrows():
+        home_id = match["time_casa_id"]
+        away_id = match["time_fora_id"]
+        kickoff = match["data_partida"]
+        home_games = team_game_history(all_data, home_id, kickoff, 10)
+        away_games = team_game_history(all_data, away_id, kickoff, 10)
+        if len(home_games) < 10 or not len(away_games):
+            continue
+        h2h = all_data[
+            all_data["gols_casa"].notna()
+            & (all_data["data_partida"] < kickoff)
+            & (
+                ((all_data["time_casa_id"] == home_id) & (all_data["time_fora_id"] == away_id))
+                | ((all_data["time_casa_id"] == away_id) & (all_data["time_fora_id"] == home_id))
+            )
+        ].sort_values("data_partida", ascending=False).head(10)
+        prediction = poisson_prediction(home_games, away_games, h2h, home_id, away_id)
+        if not prediction or prediction["casa"] <= max(prediction["empate"], prediction["fora"]):
+            continue
+
+        goal_records = goal_75_history(home_games, home_id)
+        goal_values = [record["goals"] for record in goal_records]
+        missing_ids = [
+            record["id_api"] for record in goal_records if record["goals"] is None
+        ]
+
+        coverage = sum(value is not None for value in goal_values)
+        hits = sum(value is not None and value >= 1 for value in goal_values)
+        percentage = hits / 10 * 100
+        rows.append(
+            {
+                "id_api": int(match["id_api"]),
+                "data_partida": kickoff,
+                "favorito": match["time_casa"],
+                "zebra": match["time_fora"],
+                "prob_favorito": prediction["casa"],
+                "acertos": hits,
+                "cobertura": coverage,
+                "percentual": percentage,
+                "classificado": coverage == 10 and percentage > 75,
+                "missing_ids": missing_ids,
+                "history": home_games,
+                "goal_values": goal_values,
+            }
+        )
+    return rows
+
+
+def render_lay_01(all_data, league_data, source_key):
+    st.markdown("# 🎯 Método Lay 0x1 na zebra")
+    st.caption(
+        "Favorito mandante pelo modelo · últimos 10 jogos do favorito · pelo menos 1 gol marcado entre 0' e 75'."
+    )
+    st.info(
+        "O corte é estritamente maior que 75%: na amostra de 10 jogos, o time precisa cumprir o critério em 8 ou mais. "
+        "O favoritismo é uma estimativa estatística, não uma odd de mercado nem garantia de gol."
+    )
+
+    if source_key not in ("sofascore", "onefootball"):
+        st.warning(
+            "A football-data.org não forneceu os minutos dos gols para o token atual. "
+            "Selecione **OneFootball — futebol3.db** ou **SofaScore — futebol.db** "
+            "para usar este filtro com dados exatos."
+        )
+        return
+
+    candidates = build_lay_01_candidates(all_data, league_data)
+    if not candidates:
+        st.info("Nenhum mandante favorito com 10 jogos anteriores foi encontrado nesta liga/temporada.")
+        return
+
+    missing_ids = sorted(
+        {match_id for candidate in candidates for match_id in candidate["missing_ids"]}
+    )
+    complete = sum(candidate["cobertura"] == 10 for candidate in candidates)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Favoritos mandantes", len(candidates))
+    c2.metric("Históricos completos", f"{complete}/{len(candidates)}")
+    c3.metric("Partidas sem minutos", len(missing_ids))
+
+    if missing_ids:
+        st.caption(
+            "A primeira análise da liga precisa consultar os incidentes dos jogos anteriores. "
+            f"Depois eles ficam salvos no {DB_SOURCES[source_key]['arquivo']}."
+        )
+        if st.button(
+            f"⏱️ Coletar minutos de {len(missing_ids)} partidas",
+            type="primary",
+            key=f"collect_goal_minutes_{source_key}_{league_data['liga_codigo'].iloc[0]}",
+        ):
+            progress = st.progress(0, text=f"Abrindo o {DB_SOURCES[source_key]['nome']}...")
+
+            def goal_progress(current, total, message):
+                progress.progress(current / total if total else 0, text=message)
+
+            try:
+                if source_key == "onefootball":
+                    result = coletar_minutos_onefootball(missing_ids, goal_progress)
+                else:
+                    result = coletar_minutos_sofascore(missing_ids, goal_progress)
+                load_data.clear()
+                st.session_state[f"goal_minutes_result_{source_key}"] = result
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    result_key = f"goal_minutes_result_{source_key}"
+    if result_key in st.session_state:
+        result = st.session_state.pop(result_key)
+        message = (
+            f"Minutos coletados em {result['concluidas']} partidas; "
+            f"{result['erros']} falharam."
+        )
+        if result["erros"] and source_key == "sofascore":
+            st.warning(
+                message
+                + " Se o SofaScore retornou HTTP 403, aguarde a coleta principal terminar e tente novamente."
+            )
+        elif result["erros"]:
+            st.warning(message + " Alguns jogos podem não ter eventos disponíveis no OneFootball.")
+        else:
+            st.success(message)
+
+    qualified = [candidate for candidate in candidates if candidate["classificado"]]
+    st.markdown(f"### Jogos aprovados no filtro: {len(qualified)}")
+    if not qualified:
+        if missing_ids:
+            st.warning("Complete a coleta dos minutos para liberar o resultado definitivo do filtro.")
+        else:
+            st.info("Nenhum próximo jogo atingiu mais de 75% nesta liga/temporada.")
+    else:
+        table = pd.DataFrame(
+            [
+                {
+                    "Data": candidate["data_partida"].tz_convert("America/Sao_Paulo").strftime("%d/%m/%Y %H:%M"),
+                    "Favorito em casa": candidate["favorito"],
+                    "Zebra": candidate["zebra"],
+                    "Prob. favorito": f"{candidate['prob_favorito']:.1f}%",
+                    "Gol até 75'": f"{candidate['acertos']}/10",
+                    "Percentual": f"{candidate['percentual']:.0f}%",
+                }
+                for candidate in qualified
+            ]
+        )
+        st.dataframe(table, use_container_width=True, hide_index=True)
+
+    with st.expander("Ver todos os favoritos e a cobertura dos dados"):
+        audit_table = pd.DataFrame(
+            [
+                {
+                    "Data": candidate["data_partida"].tz_convert("America/Sao_Paulo").strftime("%d/%m/%Y %H:%M"),
+                    "Favorito": candidate["favorito"],
+                    "Adversário": candidate["zebra"],
+                    "Probabilidade": f"{candidate['prob_favorito']:.1f}%",
+                    "Acertos": f"{candidate['acertos']}/10",
+                    "Dados coletados": f"{candidate['cobertura']}/10",
+                    "Situação": "✅ Aprovado" if candidate["classificado"] else ("⏳ Pendente" if candidate["cobertura"] < 10 else "❌ Abaixo de 75%"),
+                }
+                for candidate in candidates
+            ]
+        )
+        st.dataframe(audit_table, use_container_width=True, hide_index=True)
+
+
 def history_table(games):
     if games.empty:
         return pd.DataFrame()
@@ -417,7 +826,151 @@ def history_table(games):
     return table
 
 
-def render_match_analysis(match, all_data):
+def render_match_lay_01(match, home_games, prediction, source_key):
+    """Mostra o critério Lay 0x1 para a partida aberta pelo usuário."""
+    home_id = match["time_casa_id"]
+    home_name = match["time_casa"]
+    away_name = match["time_fora"]
+    match_id = int(match["id_api"])
+
+    st.markdown("### 🎯 Filtro Lay 0x1 na zebra")
+    st.caption(
+        "Regra: favorito jogando em casa e gol marcado pelo favorito entre 0' e 75' "
+        "em mais de 75% dos últimos 10 jogos anteriores."
+    )
+
+    if prediction:
+        home_is_favorite = prediction["casa"] > max(
+            prediction["empate"], prediction["fora"]
+        )
+        favorite_text = (
+            f"Sim · {prediction['casa']:.1f}%"
+            if home_is_favorite
+            else f"Não · {prediction['casa']:.1f}%"
+        )
+    else:
+        home_is_favorite = False
+        favorite_text = "Indefinido"
+
+    if source_key not in ("sofascore", "onefootball"):
+        c1, c2 = st.columns(2)
+        c1.metric("Favorito mandante", favorite_text)
+        c2.metric("Gol até 75'", "Sem dados")
+        st.warning(
+            "Esta fonte não possui os minutos dos gols. Selecione OneFootball ou "
+            "SofaScore para validar este método."
+        )
+        return
+
+    records = goal_75_history(home_games, home_id)
+    coverage = sum(record["goals"] is not None for record in records)
+    hits = sum(
+        record["goals"] is not None and record["goals"] >= 1
+        for record in records
+    )
+    missing_ids = [
+        record["id_api"] for record in records if record["goals"] is None
+    ]
+    percentage = hits / 10 * 100
+    qualified = (
+        home_is_favorite
+        and len(home_games) == 10
+        and coverage == 10
+        and percentage > 75
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Favorito mandante", favorite_text)
+    c2.metric("Gol até 75'", f"{hits}/10")
+    c3.metric("Percentual", f"{percentage:.0f}%" if coverage == 10 else "Pendente")
+    c4.metric("Dados disponíveis", f"{coverage}/10")
+
+    result_key = f"lay_match_minutes_result_{source_key}_{match_id}"
+    if result_key in st.session_state:
+        result = st.session_state.pop(result_key)
+        message = (
+            f"Minutos coletados em {result['concluidas']} partidas; "
+            f"{result['erros']} falharam."
+        )
+        st.success(message) if not result["erros"] else st.warning(message)
+
+    if missing_ids and home_is_favorite and len(home_games) == 10:
+        st.warning(
+            f"Faltam os minutos de {len(missing_ids)} dos {len(home_games)} jogos encontrados. "
+            "Colete-os para liberar o resultado definitivo."
+        )
+        if st.button(
+            f"⏱️ Coletar minutos que faltam ({len(missing_ids)})",
+            type="primary",
+            key=f"collect_match_minutes_{source_key}_{match_id}",
+        ):
+            progress = st.progress(0, text=f"Consultando {DB_SOURCES[source_key]['nome']}...")
+
+            def goal_progress(current, total, message):
+                progress.progress(current / total if total else 0, text=message)
+
+            try:
+                if source_key == "onefootball":
+                    result = coletar_minutos_onefootball(missing_ids, goal_progress)
+                else:
+                    result = coletar_minutos_sofascore(missing_ids, goal_progress)
+                load_data.clear()
+                st.session_state[result_key] = result
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+    if not prediction:
+        st.info("Ainda não há dados suficientes para confirmar quem é o favorito.")
+    elif not home_is_favorite:
+        st.error(
+            f"❌ Fora do método: o modelo não considera {home_name} favorito contra {away_name}."
+        )
+    elif len(home_games) < 10:
+        st.warning(
+            f"⏳ Amostra insuficiente: foram encontrados somente {len(home_games)} jogos anteriores."
+        )
+    elif coverage < 10:
+        st.info("⏳ Sinal pendente até completar os minutos dos 10 jogos.")
+    elif qualified:
+        st.success(
+            f"✅ APROVADO: {home_name} marcou até 75' em {hits}/10 jogos "
+            f"({percentage:.0f}%), acima do corte de 75%."
+        )
+    else:
+        st.error(
+            f"❌ REPROVADO: {home_name} marcou até 75' em {hits}/10 jogos "
+            f"({percentage:.0f}%). O mínimo prático é 8/10."
+        )
+
+    audit_rows = []
+    for record in records:
+        game = record["match"]
+        goals = record["goals"]
+        minute = record["first_minute"]
+        if goals is None:
+            criterion = "⏳ Sem minutos"
+        elif goals >= 1:
+            criterion = "✅ Sim"
+        else:
+            criterion = "❌ Não"
+        audit_rows.append(
+            {
+                "Data": game["data_partida"].tz_convert("America/Sao_Paulo").strftime("%d/%m/%Y"),
+                "Local": game["local"],
+                "Adversário": game["oponente"],
+                "Placar": f"{int(game['gols_pro'])} × {int(game['gols_contra'])}",
+                "Gols 0–75'": "—" if goals is None else goals,
+                "Primeiro gol": f"{minute}'" if minute is not None else "—",
+                "Critério": criterion,
+            }
+        )
+    if audit_rows:
+        with st.expander("Ver os 10 jogos usados no cálculo", expanded=True):
+            st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True)
+
+
+def render_match_analysis(match, all_data, source_key):
     home_id = match["time_casa_id"]
     away_id = match["time_fora_id"]
     home_name = match["time_casa"]
@@ -462,6 +1015,8 @@ def render_match_analysis(match, all_data):
         )
     else:
         st.info("Ainda não há jogos anteriores suficientes dos dois times para calcular probabilidades.")
+
+    render_match_lay_01(match, home_games, prediction, source_key)
 
     st.markdown("#### Comparativo da forma recente")
     comparison = pd.DataFrame(
@@ -624,8 +1179,27 @@ with st.sidebar:
     df_all = load_data(DB_PATH)
     st.caption(f"{source['descricao']} · {len(df_all):,} partidas no banco")
 
+    onefootball_full = False
+    if source_key == "onefootball":
+        update_scope = st.radio(
+            "Escopo da atualização",
+            ["Todas as competições", "Incremental rápida"],
+            horizontal=True,
+            key="onefootball_update_scope",
+            help=(
+                "Todas as competições percorre novamente as 429 ligas. "
+                "Incremental rápida atualiza ligas sem coleta, desatualizadas "
+                "ou com partidas próximas."
+            ),
+        )
+        onefootball_full = update_scope == "Todas as competições"
+
     if st.button(
-        f"🔄 Atualizar {source['nome']}",
+        (
+            "🔄 Atualizar todas as ligas"
+            if source_key == "onefootball" and onefootball_full
+            else f"🔄 Atualizar {source['nome']}"
+        ),
         use_container_width=True,
         type="primary",
         key=f"update_{source_key}",
@@ -639,10 +1213,16 @@ with st.sidebar:
             with st.spinner(f"Atualizando pelo {source['nome']}..."):
                 if source_key == "football_data":
                     update_result = atualizar_football_data(progresso=update_progress)
-                else:
+                elif source_key == "sofascore":
                     update_result = atualizar_sofascore(progresso=update_progress)
+                else:
+                    update_result = atualizar_onefootball(
+                        progresso=update_progress,
+                        full=onefootball_full,
+                    )
             st.session_state[f"update_result_{source_key}"] = update_result
             load_data.clear()
+            load_official_standings.clear()
             st.rerun()
         except Exception as exc:
             st.error(f"Não foi possível atualizar os dados: {exc}")
@@ -658,10 +1238,23 @@ with st.sidebar:
                 for error in result["erros"]:
                     st.write(f"• {error}")
         else:
-            st.success(
-                f"Dados atualizados: {result['inseridas']} novas e "
-                f"{result['atualizadas']} partidas revisadas."
-            )
+            if source_key == "sofascore":
+                st.success(
+                    f"Sincronização incremental concluída: "
+                    f"{result['atualizadas']} registros sincronizados."
+                )
+            elif source_key == "onefootball":
+                st.success(
+                    f"OneFootball sincronizado: {result['concluidas']}/"
+                    f"{result['consultas']} ligas concluídas, "
+                    f"{result['inseridas']} jogos novos e "
+                    f"{result['atualizadas']} revisados."
+                )
+            else:
+                st.success(
+                    f"Dados atualizados: {result['inseridas']} novas e "
+                    f"{result['atualizadas']} partidas revisadas."
+                )
 
     if os.path.exists(DB_PATH):
         updated_at = pd.Timestamp.fromtimestamp(
@@ -751,7 +1344,7 @@ with st.sidebar:
         st.session_state[view_key] = "🏆 Liga"
     view = st.radio(
         "Visão",
-        ["🏠 Início", "🏆 Liga", "👕 Time"],
+        ["🏠 Início", "🎯 Lay 0x1", "🏆 Liga", "👕 Time"],
         key=view_key,
     )
     if navigation:
@@ -783,6 +1376,9 @@ liga_full = liga_labels.get(liga_sel, liga_sel)
 if view == "🏠 Início":
     render_home(df_all, liga_labels, source_key)
 
+elif view == "🎯 Lay 0x1":
+    render_lay_01(df_all, df, source_key)
+
 elif view == "🏆 Liga":
     st.markdown(f"# {liga_full}")
     st.markdown(f"### Temporada {temp_sel}")
@@ -796,7 +1392,7 @@ elif view == "🏆 Liga":
             on_click=back_to_home,
             args=(source_key,),
         )
-        render_match_analysis(analysis_match.iloc[0], df_all)
+        render_match_analysis(analysis_match.iloc[0], df_all, source_key)
 
     st.markdown("---")
 
@@ -822,7 +1418,21 @@ elif view == "🏆 Liga":
 
     # ── TAB 1: Classificação ──────────────────────────────────────────────────
     with tab1:
-        standings = build_standings(df_played)
+        official_standings = pd.DataFrame()
+        if source_key == "onefootball" and not df.empty and df["liga_id"].notna().any():
+            league_id = int(df.loc[df["liga_id"].notna(), "liga_id"].iloc[0])
+            league_seasons = df_all.loc[
+                df_all["liga_codigo"].eq(liga_sel), "temporada"
+            ].dropna()
+            if league_seasons.empty or temp_sel == league_seasons.max():
+                official_standings = load_official_standings(DB_PATH, league_id)
+        standings = (
+            official_standings
+            if not official_standings.empty
+            else build_standings(df_played)
+        )
+        if not official_standings.empty:
+            st.caption("Classificação oficial atual fornecida pelo OneFootball.")
 
         # Color rows
         def style_standings(val, col):
